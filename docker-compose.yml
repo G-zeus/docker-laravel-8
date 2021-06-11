@@ -45,6 +45,8 @@ services:
       SERVICE_NAME: mysql
     volumes:
       - ./compose/mysql/my.cnf:/etc/mysql/my.cnf
+      - ./compose/mysql/my.cnf:/tmp/mysql.sock
+      - ./compose/mysql/my.cnf:/var/lib/mysql/mysql.sock
       - dbdata:/var/lib/mysql/
     networks:
       - laravel

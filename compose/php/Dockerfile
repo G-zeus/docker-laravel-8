@@ -1,4 +1,4 @@
-FROM php:7.4-fpm-alpine
+FROM php:8.0-fpm-alpine
 
 # Copy File Config
 ADD ./compose/php/www.conf /usr/local/etc/php-fpm.d/www.conf
@@ -15,27 +15,99 @@ RUN chown laravel:laravel /var/www/html
 # Work in the specific space
 WORKDIR /var/www/html
 
-# Install dependencies
+# persistent dependencies
 RUN apk add --no-cache \
-    freetype \
-    libpng \
-    libjpeg-turbo \
-    freetype-dev \
-    libpng-dev \
-    libjpeg-turbo-dev
+# in theory, docker-entrypoint.sh is POSIX-compliant, but priority is a working, consistent image
+		bash \
+# BusyBox sed is not sufficient for some of our sed expressions
+		sed \
+# Ghostscript is required for rendering PDF previews
+		ghostscript \
+# Alpine package for "imagemagick" contains ~120 .so files, see: https://github.com/docker-library/wordpress/pull/497
+		imagemagick \
+# For install ffmpeg
+		ffmpeg 
+		
+# fix work iconv library with alpine
+# Huge thanks to chodingsana!
+RUN apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/community/ --allow-untrusted gnu-libiconv
+ENV LD_PRELOAD /usr/lib/preloadable_libiconv.so php
 
-RUN docker-php-ext-configure gd \
-    --with-freetype \
-    --with-jpeg 
+# install the PHP extensions we need (https://make.wordpress.org/hosting/handbook/handbook/server-environment/#php-extensions)
+RUN set -ex; \
+	\
+	apk add --no-cache --virtual .build-deps \
+		$PHPIZE_DEPS \
+		freetype-dev \
+		imagemagick-dev \
+		libjpeg-turbo-dev \
+		libpng-dev \
+		libzip-dev \
+		# icu-dev is required for php intl extension
+		icu-dev \
+		# add for imagick source install
+		libtool \
+		make \
+		git \		
+	; \
+	\
+	docker-php-ext-configure gd --with-freetype --with-jpeg; \
+	docker-php-ext-configure intl; \
+	docker-php-ext-install -j "$(nproc)" \
+		bcmath \
+		exif \
+		gd \
+		mysqli \
+		zip \
+		pdo \
+		pdo_mysql \
+		intl \
+	; \
+	pecl install redis apcu; \
+	\
+	git clone https://github.com/Imagick/imagick; \
+	cd imagick; \
+	phpize && ./configure; \
+	make; \
+	make install; \
+	\
+	docker-php-ext-enable redis apcu imagick; \
+	\
+	runDeps="$( \
+		scanelf --needed --nobanner --format '%n#p' --recursive /usr/local/lib/php/extensions \
+			| tr ',' '\n' \
+			| sort -u \
+			| awk 'system("[ -e /usr/local/lib/" $1 " ]") == 0 { next } { print "so:" $1 }' \
+	)"; \
+	apk add --virtual .wordpress-phpexts-rundeps $runDeps; \
+	apk del .build-deps; \
+	rm -rf /var/www/html/imagick
 
-RUN NPROC=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || 1) && \
-    docker-php-ext-install -j${NPROC} gd 
-
-RUN apk del --no-cache freetype-dev libpng-dev libjpeg-turbo-dev
-
-RUN docker-php-ext-install pdo pdo_mysql
-
-# install and enable xdebug
-RUN apk add --no-cache $PHPIZE_DEPS \
-	&& pecl install xdebug-2.9.7 \
-	&& docker-php-ext-enable xdebug
+# set recommended PHP.ini settings
+# see https://secure.php.net/manual/en/opcache.installation.php
+RUN set -eux; \
+	docker-php-ext-enable opcache; \
+	{ \
+		echo 'opcache.memory_consumption=128'; \
+		echo 'opcache.interned_strings_buffer=8'; \
+		echo 'opcache.max_accelerated_files=4000'; \
+		echo 'opcache.revalidate_freq=2'; \
+		echo 'opcache.fast_shutdown=1'; \
+		echo 'opcache.enable=1'; \
+		echo 'opcache.jit_buffer_size=100M'; \
+                echo 'opcache.jit=tracing'; \
+	} > /usr/local/etc/php/conf.d/opcache-recommended.ini
+# https://wordpress.org/support/article/editing-wp-config-php/#configure-error-logging
+RUN { \
+# https://www.php.net/manual/en/errorfunc.constants.php
+# https://github.com/docker-library/wordpress/issues/420#issuecomment-517839670
+		echo 'error_reporting = E_ERROR | E_WARNING | E_PARSE | E_CORE_ERROR | E_CORE_WARNING | E_COMPILE_ERROR | E_COMPILE_WARNING | E_RECOVERABLE_ERROR'; \
+		echo 'display_errors = Off'; \
+		echo 'display_startup_errors = Off'; \
+		echo 'log_errors = On'; \
+		echo 'error_log = /dev/stderr'; \
+		echo 'log_errors_max_len = 1024'; \
+		echo 'ignore_repeated_errors = On'; \
+		echo 'ignore_repeated_source = Off'; \
+		echo 'html_errors = Off'; \
+	} > /usr/local/etc/php/conf.d/error-logging.ini
